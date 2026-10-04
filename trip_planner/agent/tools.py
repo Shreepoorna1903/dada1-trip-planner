@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 import requests
 from langchain.tools import tool
 from langchain_tavily import TavilySearch
+import time
+from zoneinfo import ZoneInfo
 
 # Use these URLs for their corresponding tools
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -21,6 +23,7 @@ EVENTS_URL = "https://app.ticketmaster.com/discovery/v2/events.json"
 FORECAST_DAYS = 16          # all Open-Meteo will forecast: today + 15
 MAX_RESULTS = 3
 MAX_EVENTS = 10
+LOCAL_TZ = ZoneInfo("America/New_York")   # same clock as the date in agent.py
 
 # Open-Meteo returns a WMO code, not words. Only the common ones are listed;
 # anything else falls through to "code N", which will keep the agent honest.
@@ -95,20 +98,19 @@ def get_weather(city: str, date: str = "") -> str:
     """Get the weather forecast for a city on a date (YYYY-MM-DD).
 
     Only the next 16 days can be forecast. For any date beyond that the forecast
-    does not exist, and this tool will say so.  Say that plainly instead of
+    does not exist, and this tool will say so. Say that plainly instead of
     describing what the season is usually like. Leave date empty for today.
 
     The city name is resolved to a real place, and this tool tells you WHICH
     place it picked. If other places share the name, it says so: check it matches
     what the user meant before you plan anything.
     """
-    # TODO: implement. Return a readable string
     if date:
         try:
             datetime.strptime(date.strip(), "%Y-%m-%d")
             date = date.strip()
         except ValueError:
-            return f"'{date}' is not a valid date. Use YYYY-MM-DD, or leave it empty for today."    
+            return f"'{date}' is not a valid date. Use YYYY-MM-DD, or leave it empty for today."
 
     try:
         label, lat, lon, note = _geocode(city)
@@ -118,20 +120,28 @@ def get_weather(city: str, date: str = "") -> str:
         return (f"Could not look up '{city}' (geocoding error: {e}). "
                 f"Tell the user the weather is unavailable right now; do not guess it.")
 
-    try:
-        response = requests.get(FORECAST_URL, params={
-            "latitude": lat,
-            "longitude": lon,
-            "daily": ("weather_code,temperature_2m_max,temperature_2m_min,"
-                      "precipitation_probability_max,precipitation_sum"),
-            "timezone": "auto",
-            "forecast_days": FORECAST_DAYS,
-        }, timeout=15)
-        response.raise_for_status()
-        data = response.json() or {}
-    except (requests.RequestException, ValueError) as e:
-        return (f"The forecast service failed for {label} ({e}). "
-                f"Tell the user you could not get the weather; do not guess it.{note}")
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "daily": ("weather_code,temperature_2m_max,temperature_2m_min,"
+                  "precipitation_probability_max,precipitation_sum"),
+        "timezone": "auto",
+        "forecast_days": FORECAST_DAYS,
+    }
+    # Render's free tier shares outbound IPs, so Open-Meteo can rate-limit us (429)
+    # because of other apps' traffic. A short retry usually gets through.
+    for attempt in range(3):
+        try:
+            response = requests.get(FORECAST_URL, params=params, timeout=15)
+            if response.status_code == 429 and attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            response.raise_for_status()
+            data = response.json() or {}
+            break
+        except (requests.RequestException, ValueError) as e:
+            return (f"The forecast service failed for {label} ({e}). "
+                    f"Tell the user you could not get the weather; do not guess it.{note}")
 
     daily = data.get("daily") or {}
     days = daily.get("time") or []
@@ -152,7 +162,7 @@ def get_weather(city: str, date: str = "") -> str:
     def val(key):
         vals = daily.get(key) or []
         return vals[i] if i < len(vals) else None
-    
+
     def temp(c):
         return "not available" if c is None else f"{c:.0f}°C ({c * 9 / 5 + 32:.0f}°F)"
 
@@ -223,7 +233,6 @@ def find_restaurants(city: str, budget: str = "") -> str:
         "them into a dollar figure. Report cost as unknown unless a snippet states "
         "an actual price.")
 
-
 @tool
 def find_events(city: str, date: str = "", category: str = "") -> str:
     """Find real ticketed events in a city: concerts, sport, theatre, festivals.
@@ -231,7 +240,7 @@ def find_events(city: str, date: str = "", category: str = "") -> str:
     date is YYYY-MM-DD and means that day in the venue's own local time; leave
     it empty for the week ahead. Unlike the search tools this returns structured
     records: real dates, real venues, real links.
-        
+
     For a range such as a weekend, call once per date.
 
     category narrows by type. The five broad ones always work: "music", "sports",
@@ -255,8 +264,6 @@ def find_events(city: str, date: str = "", category: str = "") -> str:
     This only covers events sold through Ticketmaster. A quiet result does not
     mean nothing is happening. Say that rather than implying the city is empty.
     """
-    # TODO: implement. Return a readable string.
-
     api_key = os.getenv("TICKETMASTER_API_KEY")
     if not api_key:
         return ("Event search is unavailable (no Ticketmaster API key configured). "
@@ -265,6 +272,7 @@ def find_events(city: str, date: str = "", category: str = "") -> str:
     city = city.strip()
     date = (date or "").strip()
     category = (category or "").strip()
+    today = datetime.now(LOCAL_TZ).date()
 
     if date:
         try:
@@ -273,7 +281,7 @@ def find_events(city: str, date: str = "", category: str = "") -> str:
             return f"'{date}' is not a valid date. Use YYYY-MM-DD, or leave it empty for the week ahead."
         end = start
     else:
-        start = datetime.now()
+        start = datetime.now(LOCAL_TZ).replace(tzinfo=None)
         end = start + timedelta(days=7)
 
     params = {
@@ -299,13 +307,17 @@ def find_events(city: str, date: str = "", category: str = "") -> str:
     window = date or f"{start:%Y-%m-%d} to {end:%Y-%m-%d}"
 
     if not events:
+        past = ""
+        if date and start.date() < today:
+            past = (f" Note: {date} has already passed. Ticketmaster only lists "
+                    f"upcoming events, so past dates return nothing.")
         if category:
             return (f"No Ticketmaster events found in {city} for {window} with category "
                     f"'{category}'. Either nothing in that category is on, or the category "
                     f"was not recognised (unknown categories also return zero results). "
-                    f"Search again without the category before telling the user nothing is on.")
+                    f"Search again without the category before telling the user nothing is on.{past}")
         return (f"No Ticketmaster events found in {city} for {window}. This only covers "
-                f"Ticketmaster; do not tell the user the city has nothing happening.")
+                f"Ticketmaster; do not tell the user the city has nothing happening.{past}")
 
     def price(ev):
         ranges = ev.get("priceRanges") or []
@@ -321,8 +333,10 @@ def find_events(city: str, date: str = "", category: str = "") -> str:
              f"(showing {len(events)} of {total}, earliest first):"]
     if total > len(events):
         if date:
-            lines.append(f"More events exist on {date} than shown; later times that day "
-                         f"may be missing. Add a category to narrow the results.")
+            hint = "later times that day may be missing."
+            if not category:
+                hint += " Add a category to narrow the results."
+            lines.append(f"More events exist on {date} than shown; {hint}")
         else:
             lines.append("More events exist than shown, so later days in this window may be "
                          "missing. Search a specific date to see them.")
