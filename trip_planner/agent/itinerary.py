@@ -97,7 +97,8 @@ def build_itinerary(model, result) -> Itinerary:
         "price or a price of 0 is never 'free'. If a tool result states a price for "
         "something at a place (e.g. a $9 dish), put it in cost with its source, like "
         "'$9 noodle bowl (The Infatuation)'. Put everything the tools could not "
-        "confirm in unknowns.\n\n"
+        "confirm in unknowns, including opening hours "
+        "for every place in the plan.\n\n"
         f"Conversation:\n{transcript}"
     )
 

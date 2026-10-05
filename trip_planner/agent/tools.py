@@ -23,7 +23,7 @@ EVENTS_URL = "https://app.ticketmaster.com/discovery/v2/events.json"
 FORECAST_DAYS = 16          # all Open-Meteo will forecast: today + 15
 MAX_RESULTS = 3
 MAX_EVENTS = 10
-LOCAL_TZ = ZoneInfo("America/New_York")   # same clock as the date in agent.py
+LOCAL_TZ = ZoneInfo("America/New_York")   
 
 # Open-Meteo returns a WMO code, not words. Only the common ones are listed;
 # anything else falls through to "code N", which will keep the agent honest.
@@ -128,8 +128,6 @@ def get_weather(city: str, date: str = "") -> str:
         "timezone": "auto",
         "forecast_days": FORECAST_DAYS,
     }
-    # Render's free tier shares outbound IPs, so Open-Meteo can rate-limit us (429)
-    # because of other apps' traffic. A short retry usually gets through.
     for attempt in range(3):
         try:
             response = requests.get(FORECAST_URL, params=params, timeout=15)
